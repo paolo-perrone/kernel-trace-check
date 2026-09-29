@@ -1,5 +1,9 @@
 # kernel-trace-check
 
+> Tested on eight recorded torch.profiler traces from Meta's Holistic Trace Analysis test data, V100 to H100. Not yet run on a live vLLM serving trace.
+
+Companion to [What is a GPU Kernel?](https://theaiengineer.substack.com/p/what-is-a-gpu-kernel), The AI Engineer.
+
 For engineers who train or serve a model with PyTorch or vLLM on NVIDIA GPUs,
 and want to know what their GPU time is waiting on before they touch a kernel:
 the CPU, SMs left empty, memory, or nothing at all.
@@ -21,39 +25,6 @@ lever, 2 on INCONCLUSIVE, 1 on a file it cannot read.
 
 Read-only, standard-library Python, no GPU and no API key: copy the trace off the
 machine and run it on a laptop.
-
-## Export a trace
-
-From a PyTorch loop, profile five steps and keep the last three:
-
-```python
-from torch.profiler import profile, schedule, tensorboard_trace_handler, ProfilerActivity
-with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-             schedule=schedule(wait=1, warmup=1, active=3),
-             on_trace_ready=tensorboard_trace_handler("./trace", use_gzip=True)) as prof:
-    for _, batch in zip(range(5), loader):
-        train_step(batch); prof.step()
-```
-
-then run `python3 kernel_trace_check.py ./trace`. The schedule matters twice: `prof.step()` writes
-the `ProfilerStep#N` markers the tool uses as windows, and the skipped first step is the one that
-allocates memory and loads kernels.
-
-From vLLM (v0.13 or later), start the server with a profiler config and bracket some traffic:
-
-```
-vllm serve <model> --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./vllm_profile", "warmup_iterations": 2, "active_iterations": 5, "torch_profiler_with_stack": false}'
-curl -X POST localhost:8000/start_profile
-# send a few requests
-curl -X POST localhost:8000/stop_profile
-python3 kernel_trace_check.py ./vllm_profile
-```
-
-A `warmup_iterations` above zero turns on vLLM's profiler schedule, and that is what writes one
-`ProfilerStep#N` per engine step; without it the tool splits the timeline at idle stretches of 50 ms
-and says so. Given a folder, it reads the largest trace in it that holds kernels, because vLLM writes
-one per worker and can add a CPU-only one for its frontend. Stack recording is off in that config
-because the tool never reads it and it multiplies the file size.
 
 ## What it prints, on a case with a known answer
 
@@ -93,6 +64,39 @@ microseconds: launch overhead, which a CUDA graph removes by replaying the whole
 launch. The `waited on` rows are the kernel shapes the GPU waited for longest, and the `then` line is
 the lever that comes next once the gaps close: 30.0% of compute time ran on fewer blocks than the
 132 SMs.
+
+## Export a trace
+
+From a PyTorch loop, profile five steps and keep the last three:
+
+```python
+from torch.profiler import profile, schedule, tensorboard_trace_handler, ProfilerActivity
+with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+             schedule=schedule(wait=1, warmup=1, active=3),
+             on_trace_ready=tensorboard_trace_handler("./trace", use_gzip=True)) as prof:
+    for _, batch in zip(range(5), loader):
+        train_step(batch); prof.step()
+```
+
+then run `python3 kernel_trace_check.py ./trace`. The schedule matters twice: `prof.step()` writes
+the `ProfilerStep#N` markers the tool uses as windows, and the skipped first step is the one that
+allocates memory and loads kernels.
+
+From vLLM (v0.13 or later), start the server with a profiler config and bracket some traffic:
+
+```
+vllm serve <model> --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./vllm_profile", "warmup_iterations": 2, "active_iterations": 5, "torch_profiler_with_stack": false}'
+curl -X POST localhost:8000/start_profile
+# send a few requests
+curl -X POST localhost:8000/stop_profile
+python3 kernel_trace_check.py ./vllm_profile
+```
+
+A `warmup_iterations` above zero turns on vLLM's profiler schedule, and that is what writes one
+`ProfilerStep#N` per engine step; without it the tool splits the timeline at idle stretches of 50 ms
+and says so. Given a folder, it reads the largest trace in it that holds kernels, because vLLM writes
+one per worker and can add a CPU-only one for its frontend. Stack recording is off in that config
+because the tool never reads it and it multiplies the file size.
 
 ## How each number is computed
 
