@@ -743,6 +743,8 @@ def render(r):
         d += f"; the busiest of {r['devices_with_kernels']} devices with kernels"
     out.append(lab("device") + d)
     wins = r["windows"]
+    if not wins:    # every step marker had zero length, so no window survived to judge
+        return "\n".join(out + [""] + _wrap("INCONCLUSIVE", r["reason"]))
     judged = [w for w in wins if w["judged"]]
     shown = judged or wins
     steps = r["window_source"] == "steps"

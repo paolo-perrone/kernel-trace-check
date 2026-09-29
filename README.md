@@ -181,12 +181,12 @@ line gives the margin: the range over which the bar could move without changing 
 ## Check it before you trust it
 
 `python3 test_kernel_trace_check.py` replays eight real traces with known verdicts, one or more for
-every lever and refusal the corpus reaches, then runs 46 unit checks, most on hand-written traces
+every lever and refusal the corpus reaches, then runs 47 unit checks, most on hand-written traces
 where every gap is known in advance. It must print:
 
 ```
 8/8 recorded traces pass
-46/46 unit checks pass
+47/47 unit checks pass
 ```
 
 One unit check redoes the H100 fixture by hand from its raw JSON: the busy time of ProfilerStep#59

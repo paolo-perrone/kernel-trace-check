@@ -345,6 +345,14 @@ def unit_checks():
         nxt = [e for e in evs if e["cat"] == "kernel" and e["ts"] == g["end_us"] and e["args"].get("device") == 1]
         check(not touching and nxt and all(launch[e["args"]["correlation"]] > g["start_us"] for e in nxt),
               "largest gap: nothing runs inside it, and the next kernel was launched after it began")
+
+    # a step marker of zero length leaves no window: the report says INCONCLUSIVE instead of crashing
+    ev = [call("cudaLaunchKernel", 1, 0.5, 1), kernel(GEMM, 2, 5, 1, bps=10.0), step(1, 0, 0)]
+    try:
+        text = ktc.render(run(ev))
+    except Exception as e:  # noqa: BLE001
+        text = f"crashed: {type(e).__name__}"
+    check("INCONCLUSIVE" in text, f"zero-length step must print INCONCLUSIVE, got {text[-80:]!r}")
     return ran[0], fails
 
 
