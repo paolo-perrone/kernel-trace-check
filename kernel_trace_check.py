@@ -37,7 +37,7 @@ import statistics
 import sys
 import textwrap
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # The bars. README.md ("Why the bars sit where they do") gives the reason for each.
 HOST_WAIT_MIN = 0.30      # (a) host wait before eager launches / step time
@@ -668,11 +668,17 @@ def analyze(meta, events, device=None, split_ms=SPLIT_MS, label="trace"):
     if lever == "cuda-graphs":
         if sh["small_grid"] is not None and sh["small_grid"] >= SMALL_GRID_MIN:
             then.append("batch-or-shape")
-        elif fusion_applies(sh):
+        if fusion_applies(sh):
             then.append("fusion")
     elif lever == "batch-or-shape" and fusion_applies(sh):
         then.append("fusion")
-    r.update(verdict=verdict, lever=lever, reason=reason, top=top, then=then)
+    ceiling = None
+    if lever == "cuda-graphs":      # closing every launch gap is the most a graph removes
+        ceiling = idle["launch"]
+    elif lever == "fusion":         # fusion cannot save more than those kernels' own run time
+        ceiling = min(kt.get("elementwise", 0.0), span)
+    r.update(verdict=verdict, lever=lever, reason=reason, top=top, then=then,
+             ceiling_us=ceiling, ceiling_share=share(ceiling, span) if ceiling is not None else None)
     return r
 
 
@@ -729,6 +735,49 @@ def _table(out, label, rows):
 def _wrap(label, text, width=100):
     lines = textwrap.wrap(text, width=width)
     return [lab(label) + lines[0]] + [lab("") + ln for ln in lines[1:]]
+
+
+def _ceiling(r, condition):
+    """The most the named lever can save: its share of step time, and per step when steps exist."""
+    txt = f"{p1(r['ceiling_share'])} of {r['unit']} saved"
+    if r["window_source"] == "steps" and r["judged"]:
+        now = r["span_us"] / len(r["judged"]) / 1000
+        low = (r["span_us"] - r["ceiling_us"]) / len(r["judged"]) / 1000
+        txt += f": {now:,.1f} ms a step down to no less than {low:,.1f} ms"
+    return f"{txt}, {condition}"
+
+
+LEVER_NAME = {"cuda-graphs": "CUDA graphs", "batch-or-shape": "a bigger batch or a rounded shape",
+              "fusion": "fusion", "leave-alone": "leave the kernels alone"}
+
+
+def compare(a, b):
+    """Two reports side by side: what a change bought, per step, and where the time moved."""
+    out = ["kernel_trace_check · compare"]
+    for name, r in (("before", a), ("after", b)):
+        if r["device"] is None or not r["judged"]:
+            return "\n".join(out + [""] + _wrap("INCONCLUSIVE", f"{r['trace']}: {r['reason']}"))
+    per = lambda r: r["span_us"] / len(r["judged"]) / 1000
+    each = "a step" if a["window_source"] == b["window_source"] == "steps" else "a window"
+    for name, r in (("before", a), ("after", b)):
+        verdict = f"LEVER {LEVER_NAME[r['lever']]}" if r["verdict"] == "LEVER" else "INCONCLUSIVE"
+        out.append(lab(name) + f"{r['trace']}: {len(r['judged'])} windows on {r.get('gpu') or 'GPU ' + str(r['device'])}, "
+                   f"{per(r):,.1f} ms {each}, {verdict}")
+    if (a.get("gpu") or a["device"]) != (b.get("gpu") or b["device"]):
+        out.append(lab("caveat") + "different GPUs: the difference is the hardware as much as any change")
+    s0, s1 = per(a), per(b)
+    out.append(lab("step time") + f"{s0:,.1f} ms to {s1:,.1f} ms {each} ({(s1 - s0) / s0 * 100:+.1f}%)")
+    sa, sb = a["shares"], b["shares"]
+    out.append(lab("busy") + f"{p1(sa['busy'])} to {p1(sb['busy'])} of {a['unit']}")
+    out.append(lab("host wait") + f"{p1(sa['idle']['launch'])} to {p1(sb['idle']['launch'])} before eager launches")
+    out.append(lab("kernels") + f"{a['kernels']:,} to {b['kernels']:,}, median {a['median_kernel_us']:,.0f} to "
+               f"{b['median_kernel_us']:,.0f} us")
+    moved = [(c, sa["compute"].get(c, 0.0), sb["compute"].get(c, 0.0)) for c in CLASSES if c != "NCCL"]
+    moved = [m for m in moved if max(m[1], m[2]) >= 0.005]
+    moved.sort(key=lambda m: -abs(m[2] - m[1]))
+    out.append(lab("compute") + ", ".join(f"{c} {p1(x)} to {p1(y)}" for c, x, y in moved))
+    out.append(lab("NCCL") + f"{p1(sa['nccl'])} to {p1(sb['nccl'])} of kernel time")
+    return "\n".join(out)
 
 
 def render(r):
@@ -829,6 +878,7 @@ def render(r):
                    "unless it runs with --enforce-eager")
         if r["idle_us"]["blocked"] > 0:
             out.append(lab("") + f"the {p1(si['blocked'])} after a blocking CUDA call stays: a graph cannot span a sync")
+        out.append(lab("at most") + _ceiling(r, "if every launch gap closes"))
         out.append(lab("waited on") + f"{'idle':>6} {'gaps':>8}  " + SHAPE_HEAD + "  kernel")
         for t in r["top"]:
             out.append(lab("") + f"{p1(t['share']):>6} {t['gaps']:>8,}  " + _shape(t) + "  " + short(t["name"], 56))
@@ -849,6 +899,7 @@ def render(r):
                        "values on chip")
             out.append(lab("") + "torch.compile fuses chains of elementwise, reduction and norm kernels into single "
                        "Triton kernels")
+            out.append(lab("at most") + _ceiling(r, "if fusion removed those kernels' time entirely"))
         else:
             g = sh["largest_group"]
             if g == "matmul and attention":
@@ -911,8 +962,21 @@ def main(argv=None):
     ap.add_argument("--split-ms", type=float, default=SPLIT_MS,
                     help=f"with no ProfilerStep markers, split at idle stretches this long (default {SPLIT_MS:g})")
     ap.add_argument("--json", action="store_true", help="print every number as JSON instead of the report")
+    ap.add_argument("--compare", nargs=2, metavar=("BEFORE", "AFTER"),
+                    help="read two traces of the same job and print what changed between them")
     ap.add_argument("--version", action="version", version=f"kernel_trace_check {__version__}")
     a = ap.parse_args(argv)
+    if a.compare:
+        reports = []
+        for path in a.compare:
+            try:
+                label, meta, events = load(path)
+            except TraceError as e:
+                print(f"kernel_trace_check: {e}", file=sys.stderr)
+                return 1
+            reports.append(analyze(meta, events, device=a.device, split_ms=a.split_ms, label=label))
+        print(compare(*reports))
+        return 0 if all(r["verdict"] == "LEVER" for r in reports) else 2
     if a.trace == "-" and sys.stdin.isatty():
         ap.error("pass a trace file or folder, or pipe one in")
     try:

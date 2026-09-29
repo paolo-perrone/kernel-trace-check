@@ -353,6 +353,32 @@ def unit_checks():
     except Exception as e:  # noqa: BLE001
         text = f"crashed: {type(e).__name__}"
     check("INCONCLUSIVE" in text, f"zero-length step must print INCONCLUSIVE, got {text[-80:]!r}")
+
+    # the most the named lever can save: a graph can at best close every launch gap
+    r, text = report("h100-train.json.gz")
+    check(abs(r["ceiling_share"] - r["shares"]["idle"]["launch"]) < 1e-9,
+          "CUDA graphs' ceiling is the host wait before eager launches")
+    check("at most      43.2% of step time saved: 148.0 ms a step down to no less than 84.0 ms, if every launch "
+          "gap closes" in text, "the H100 report prints its ceiling per step")
+    check(text.count("\nthen ") == 2 and "then         fusion:" in text,
+          "every other lever whose bar is met prints on its own then line")
+    r, text = report("a100-embedding-train.json.gz")
+    check(abs(r["ceiling_us"] - r["kernel_us_by_class"]["elementwise"]) < 1e-6,
+          "fusion's ceiling is the eager elementwise kernels' own run time")
+    r, text = report("v100-cnn-train.json.gz")
+    check(r["ceiling_us"] is None and "at most" not in text, "leave the kernels alone names no saving")
+
+    # --compare: what a change bought, per step, and a warning when the GPU changed too
+    a, b = report("a100-embedding-train.json.gz")[0], report("v100-embedding-train.json.gz")[0]
+    same = ktc.compare(a, a)
+    check("(+0.0%)" in same and "caveat" not in same, "a trace compared with itself changes nothing")
+    both = ktc.compare(a, b)
+    check("caveat       different GPUs" in both and "77.5 ms to 124.1 ms a step (+60.1%)" in both,
+          "a change of GPU is flagged, and the step time moves as measured")
+    with contextlib.redirect_stdout(io.StringIO()):
+        code = ktc.main(["--compare", os.path.join(FX, "a100-embedding-train.json.gz"),
+                         os.path.join(FX, "v100-embedding-train.json.gz")])
+    check(code == 0, f"--compare exits 0 on two traces with verdicts, got {code}")
     return ran[0], fails
 
 

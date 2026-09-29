@@ -51,19 +51,22 @@ LEVER        CUDA graphs: the GPU sat idle waiting for the CPU to launch the nex
              37,614 kernels of median 3 us went out one launch at a time, slower than the GPU ran them
              torch.compile(mode="reduce-overhead") replays them as one CUDA graph; vLLM does unless it runs with --enforce-eager
              the 0.4% after a blocking CUDA call stays: a graph cannot span a sync
+at most      43.2% of step time saved: 148.0 ms a step down to no less than 84.0 ms, if every launch gap closes
 waited on      idle     gaps     median  grid        block      blk/SM  kernel
                4.6%    1,215       3 us  512x1x1     128x1x1      3.88  layer_norm_grad_input_kernel<float, float>
                3.1%    1,197       3 us  512x1x1     32x4x1       3.88  vectorized_layer_norm_kernel<float, float>
                2.8%    1,239       1 us  1x1x1       128x1x1      0.01  unrolled_elementwise_kernel<AUnaryFunctor<float, floa...
 then         a bigger batch or a rounded shape: 30.0% of compute-kernel time ran on grids under 1 block per SM
+then         fusion: eager elementwise kernels take 40.4% of compute-kernel time
 ```
 
 The GPU ran something for half of each step. For 43.2% of the step it sat idle because the next
 kernel had not been launched yet, over thousands of gaps between kernels that run for 3
 microseconds: launch overhead, which a CUDA graph removes by replaying the whole sequence from one
-launch. The `waited on` rows are the kernel shapes the GPU waited for longest, and the `then` line is
-the lever that comes next once the gaps close: 30.0% of compute time ran on fewer blocks than the
-132 SMs.
+launch. The `at most` line is the ceiling on that fix: if every launch gap closed, a 148.0 ms step
+would drop to 84.0 ms and no lower. The `waited on` rows are the kernel shapes the GPU waited for
+longest, and each `then` line is another lever whose bar this trace also meets, in the order the
+rule checks them.
 
 ## Export a trace
 
@@ -98,6 +101,55 @@ and says so. Given a folder, it reads the largest trace in it that holds kernels
 one per worker and can add a CPU-only one for its frontend. Stack recording is off in that config
 because the tool never reads it and it multiplies the file size.
 
+## What to change, lever by lever
+
+- **CUDA graphs.** In a PyTorch loop, `model = torch.compile(model, mode="reduce-overhead")` records
+  the step's launches as a CUDA graph and replays them with one launch. It needs the same shapes every
+  step (pad or bucket the batch) and no CPU sync inside the step: no `.item()`, no printing a tensor,
+  no branching on a GPU value. vLLM captures graphs by default; remove `--enforce-eager` if it is set.
+- **A bigger batch or a rounded shape.** Raise the batch (`--max-num-seqs` in vLLM) until step time
+  per sample stops falling, or pad the dimension that sets the grid to a multiple of 64, the way
+  nanoGPT's vocabulary went from 50,257 to 50,304.
+- **Fusion.** `model = torch.compile(model)` in its default mode fuses chains of elementwise, norm and
+  reduction kernels into single Triton kernels. vLLM already compiles its models, so the gain there is
+  a custom op, not a flag.
+- **Leave the kernels alone.** The kernels are doing the math. The next gain is less math: bf16 or fp16
+  autocast when the FP32 line appears, a smaller model, or quantized weights.
+
+Then profile the same steps again and check what the change bought.
+
+## Check what the change bought
+
+`--compare BEFORE AFTER` reads two traces of the same job and prints what moved: the step time, the
+busy and host-wait shares, the kernel count and the compute split. `fixtures/v100-embedding-train`
+holds the same six training steps as `fixtures/a100-embedding-train`, run on a V100 (Holistic Trace
+Analysis ships the pair for its own trace-diff tests), so the example below compares hardware
+rather than a code change, and the `caveat` line says so:
+
+```
+python3 kernel_trace_check.py --compare fixtures/a100-embedding-train.json.gz fixtures/v100-embedding-train.json.gz
+```
+
+```
+kernel_trace_check · compare
+before       a100-embedding-train.json.gz: 6 windows on NVIDIA A100-PG509-200, 77.5 ms a step, LEVER fusion
+after        v100-embedding-train.json.gz: 6 windows on Tesla V100-SXM2-16GB, 124.1 ms a step, LEVER leave the kernels alone
+caveat       different GPUs: the difference is the hardware as much as any change
+step time    77.5 ms to 124.1 ms a step (+60.1%)
+busy         83.6% to 96.3% of step time
+host wait    13.0% to 0.1% before eager launches
+kernels      8,568 to 9,876, median 9 to 11 us
+compute      matmul 29.2% to 37.0%, elementwise 35.3% to 29.0%, other memory-bound 35.6% to 34.1%
+NCCL         36.6% to 31.3% of kernel time
+```
+
+## Next to Holistic Trace Analysis
+
+Meta's Holistic Trace Analysis reads every rank of a job and breaks its time down many ways, and
+this tool borrows its test for host wait. What this adds is the decision: one lever, the number that
+decided it, the most that lever can save, and a before-and-after compare, from a single file that
+needs nothing beyond the Python standard library.
+
 ## How each number is computed
 
 - **windows**: the CPU span of each `ProfilerStep#N` event, summed. With no step markers, the GPU
@@ -129,6 +181,12 @@ because the tool never reads it and it multiplies the file size.
     sorts, multi-tensor optimizers, vLLM custom ops).
 - **grids**: compute-kernel time in kernels whose `blocks per SM` (grid blocks divided by the SM
   count, as Kineto records it) is under 1.
+- **at most**: the most the named lever can save. For CUDA graphs it is the host wait before eager
+  launches, since a graph can at best close every one of those gaps; for fusion it is the eager
+  elementwise kernels' own run time. With step markers it prints the step time now and the step time
+  minus that ceiling. The real saving is lower: a graph cannot capture code with a sync or a
+  data-dependent shape, and a fused kernel still reads and writes memory once. The other two levers
+  print no ceiling, because a bigger batch changes the work itself.
 - **largest gap**: the longest host-wait gap and the timestamp where it starts, in microseconds as
   in the trace. Open the trace in ui.perfetto.dev, go to that time, and the GPU rows stay empty until
   the named kernel, whose launch call starts after the gap began.
@@ -138,7 +196,8 @@ work after each.
 
 ## The rule
 
-The first line that applies decides, so the tool never names two levers.
+The first line that applies decides, so the tool never names two levers. Every other lever whose
+bar the trace also meets prints below the verdict on its own `then` line, in rule order.
 
 1. **INCONCLUSIVE** when the trace has no kernel events, when every window is a warm-up, when fewer
    than 50 kernels remain, or when NCCL kernels take over 50% of kernel time.
@@ -185,12 +244,12 @@ line gives the margin: the range over which the bar could move without changing 
 ## Check it before you trust it
 
 `python3 test_kernel_trace_check.py` replays eight real traces with known verdicts, one or more for
-every lever and refusal the corpus reaches, then runs 47 unit checks, most on hand-written traces
+every lever and refusal the corpus reaches, then runs 55 unit checks, most on hand-written traces
 where every gap is known in advance. It must print:
 
 ```
 8/8 recorded traces pass
-47/47 unit checks pass
+55/55 unit checks pass
 ```
 
 One unit check redoes the H100 fixture by hand from its raw JSON: the busy time of ProfilerStep#59
@@ -205,8 +264,8 @@ was trimmed, and HTA's MIT license.
 - It reads one GPU: the busiest, or `--device N`. A collective waits on the slowest rank, so a trace
   dominated by NCCL is refused rather than judged; read every rank together with Holistic Trace
   Analysis.
-- It names a lever; it does not measure what pulling it buys. Make the change, profile again, and
-  compare the two reports.
+- It names a lever and the most that lever can save; it cannot make the change. Make it, profile
+  again, and run `--compare` on the two traces.
 - It does not see inside a kernel. Memory bandwidth, achieved occupancy and tensor-core use are
   Nsight Compute's job; the one inference from a name is the FP32 line (`sgemm`, `scudnn`).
 - A small grid here means under one block per SM. A grid of 1.05 waves wastes most of its second
@@ -221,7 +280,7 @@ was trimmed, and HTA's MIT license.
 
 ## Support
 
-Tested on 2026-09-28 with Python 3.9 and 3.14; CI runs 3.9, 3.12 and 3.13. Standard library only,
+Tested on 2026-09-29 with Python 3.9 and 3.14; CI runs 3.9, 3.12 and 3.13. Standard library only,
 so there is no lockfile to drift. It reads Kineto's Chrome-trace JSON (`schemaVersion` 1), tested on
 traces from 2022 (the older `Kernel` and `Runtime` category names) to 2026 (a Blackwell trace from
 PyTorch 2.10), with launches through `cudaLaunchKernel`, `cudaLaunchKernelExC`, `cuLaunchKernel`,
