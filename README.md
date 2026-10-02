@@ -4,6 +4,25 @@
 
 Companion to [What is a GPU Kernel?](https://theaiengineer.substack.com/p/what-is-a-gpu-kernel), The AI Engineer.
 
+## Start here: watch the three speedups on your own GPU
+
+`kernel_speedups.ipynb` reproduces the issue's three effects in about two minutes on any NVIDIA GPU:
+a size padded to a multiple of 64, two steps merged into one kernel, and small kernels replayed as a
+CUDA graph. [Open it in Colab](https://colab.research.google.com/github/paolo-perrone/kernel-trace-check/blob/main/kernel_speedups.ipynb),
+pick Runtime > Change runtime type > T4 GPU, then Runtime > Run all. On a free Colab T4 with PyTorch 2.11
+on 2 October 2026 it printed:
+
+    vocabulary 50,257: 44.22 ms per multiply
+    vocabulary 50,304: 26.80 ms per multiply
+    the padded size runs 1.65x as fast
+    two kernels: 4.54 ms | one merged kernel: 2.28 ms | 2.0x as fast
+    20 layers, one kernel each: 0.538 ms | the same kernels replayed as a CUDA graph: 0.063 ms | 8.5x as fast
+
+Your numbers will differ by GPU. Then run the checker below on a trace of your own training loop to
+see which of the three your model needs.
+
+## The checker
+
 For engineers who train or serve a model with PyTorch or vLLM on NVIDIA GPUs,
 and want to know what their GPU time is waiting on before they touch a kernel:
 the CPU, SMs left empty, memory, or nothing at all.
